@@ -24,6 +24,7 @@ namespace GitHub.Runner.Worker
         TemplateToken ContinueOnError { get; }
         string DisplayName { get; set; }
         IExecutionContext ExecutionContext { get; set; }
+        Int32 Retries { get; set; }
         TemplateToken Timeout { get; }
         Task RunAsync();
     }
@@ -280,73 +281,87 @@ namespace GitHub.Runner.Worker
                 step.ExecutionContext.Error("An error occurred when attempting to determine the step timeout.");
                 step.ExecutionContext.Error(ex);
             }
-            if (timeoutMinutes > 0)
-            {
-                var timeout = TimeSpan.FromMinutes(timeoutMinutes);
-                step.ExecutionContext.SetTimeout(timeout);
-            }
 
-            await EncodingUtil.SetEncoding(HostContext, Trace, step.ExecutionContext.CancellationToken);
-
-            try
+            while (true)
             {
-                await step.RunAsync();
-            }
-            catch (OperationCanceledException ex)
-            {
-                if (step.ExecutionContext.CancellationToken.IsCancellationRequested &&
-                    !jobCancellationToken.IsCancellationRequested)
+                if (timeoutMinutes > 0)
                 {
-                    Trace.Error($"Caught timeout exception from step: {ex.Message}");
-                    step.ExecutionContext.Error("The action has timed out.");
-                    step.ExecutionContext.Result = TaskResult.Failed;
+                    var timeout = TimeSpan.FromMinutes(timeoutMinutes);
+                    step.ExecutionContext.SetTimeout(timeout);
                 }
-                else
-                {
-                    // Log the exception and cancel the step.
-                    Trace.Error($"Caught cancellation exception from step: {ex}");
-                    step.ExecutionContext.Error(ex);
-                    step.ExecutionContext.Result = TaskResult.Canceled;
-                }
-            }
-            catch (Exception ex)
-            {
-                // Log the error and fail the step.
-                Trace.Error($"Caught exception from step: {ex}");
-                step.ExecutionContext.Error(ex);
-                step.ExecutionContext.Result = TaskResult.Failed;
-            }
 
-            // Merge execution context result with command result
-            if (step.ExecutionContext.CommandResult != null)
-            {
-                step.ExecutionContext.Result = TaskResultUtil.MergeTaskResults(step.ExecutionContext.Result, step.ExecutionContext.CommandResult.Value);
-            }
+                await EncodingUtil.SetEncoding(HostContext, Trace, step.ExecutionContext.CancellationToken);
 
-            // Fixup the step result if ContinueOnError.
-            if (step.ExecutionContext.Result == TaskResult.Failed)
-            {
-                var continueOnError = false;
                 try
                 {
-                    continueOnError = templateEvaluator.EvaluateStepContinueOnError(step.ContinueOnError, step.ExecutionContext.ExpressionValues, step.ExecutionContext.ExpressionFunctions);
+                    await step.RunAsync();
+                }
+                catch (OperationCanceledException ex)
+                {
+                    if (step.ExecutionContext.CancellationToken.IsCancellationRequested &&
+                        !jobCancellationToken.IsCancellationRequested)
+                    {
+                        Trace.Error($"Caught timeout exception from step: {ex.Message}");
+                        step.ExecutionContext.Error("The action has timed out.");
+                        step.ExecutionContext.Result = TaskResult.Failed;
+                    }
+                    else
+                    {
+                        // Log the exception and cancel the step.
+                        Trace.Error($"Caught cancellation exception from step: {ex}");
+                        step.ExecutionContext.Error(ex);
+                        step.ExecutionContext.Result = TaskResult.Canceled;
+                    }
                 }
                 catch (Exception ex)
                 {
-                    Trace.Info("The step failed and an error occurred when attempting to determine whether to continue on error.");
-                    Trace.Error(ex);
-                    step.ExecutionContext.Error("The step failed and an error occurred when attempting to determine whether to continue on error.");
+                    // Log the error and fail the step.
+                    Trace.Error($"Caught exception from step: {ex}");
                     step.ExecutionContext.Error(ex);
+                    step.ExecutionContext.Result = TaskResult.Failed;
                 }
 
-                if (continueOnError)
+                // Merge execution context result with command result
+                if (step.ExecutionContext.CommandResult != null)
                 {
-                    step.ExecutionContext.Outcome = step.ExecutionContext.Result;
-                    step.ExecutionContext.Result = TaskResult.Succeeded;
-                    Trace.Info($"Updated step result (continue on error)");
+                    step.ExecutionContext.Result = TaskResultUtil.MergeTaskResults(step.ExecutionContext.Result, step.ExecutionContext.CommandResult.Value);
                 }
+
+                // Fixup the step result if ContinueOnError.
+                if (step.ExecutionContext.Result == TaskResult.Failed)
+                {
+                    var continueOnError = false;
+                    try
+                    {
+                        continueOnError = templateEvaluator.EvaluateStepContinueOnError(step.ContinueOnError, step.ExecutionContext.ExpressionValues, step.ExecutionContext.ExpressionFunctions);
+                    }
+                    catch (Exception ex)
+                    {
+                        Trace.Info("The step failed and an error occurred when attempting to determine whether to continue on error.");
+                        Trace.Error(ex);
+                        step.ExecutionContext.Error("The step failed and an error occurred when attempting to determine whether to continue on error.");
+                        step.ExecutionContext.Error(ex);
+                    }
+
+                    if (continueOnError)
+                    {
+                        step.ExecutionContext.Outcome = step.ExecutionContext.Result;
+                        step.ExecutionContext.Result = TaskResult.Succeeded;
+                        Trace.Info($"Updated step result (continue on error)");
+                    }
+                }
+                Trace.Info($"Step result: {step.ExecutionContext.Result}");
+
+                if (step.ExecutionContext.Result == TaskResult.Failed && step.Retries > 0)
+                {
+                    step.Retries--;
+                    // todo: replace the step cancellation token source
+                    // todo: reset the step.ExecutionContext.CommandResult
+                    continue;
+                }
+
+                break;
             }
-            Trace.Info($"Step result: {step.ExecutionContext.Result}");
 
             // Complete the step context.
             step.ExecutionContext.Debug($"Finishing: {step.DisplayName}");
